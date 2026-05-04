@@ -1,0 +1,487 @@
+--[[
+	Client-side controller for the in-game troll menu.
+
+	When the player opens the menu the camera detaches from their own
+	character and starts spectating other players. They can cycle
+	through targets and trigger paid actions (Kill, Explode, etc.) on
+	whoever they're currently watching. Each action prompts a Robux
+	purchase and the server applies the effect on success.
+
+	Module is split into 3 parts:
+	  Maid         - cleans up connections / instances / callbacks
+	  Spectator    - owns the spectating state + drives the camera
+	  TrollHandler - public module, wires UI to everything else
+
+	The original script mixed UI wiring, connection lifetimes and
+	camera state in one big scope. Connection leaks are the main
+	source of weird bugs in client code so centralising the cleanup
+	in a Maid catches most of them before they happen.
+--]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+
+local Controllers = require(script.Parent)
+local MonetizationList = require(ReplicatedStorage.Shared.Misc.Monetization)
+local Notification = require(ReplicatedStorage.Shared.Misc.Notification)
+local TweenFov = require(ReplicatedStorage.Shared.Tweens.TweenFOV)
+
+local Player = Players.LocalPlayer
+local Camera = workspace.CurrentCamera
+local Remotes = ReplicatedStorage.Remotes
+
+
+-- == Maid ==
+-- Holds disposables and cleans them all in one go. Inspired by Quenty's
+-- Maid module, just without the dependency. Accepts:
+--   RBXScriptConnections (calls :Disconnect)
+--   Instances            (calls :Destroy)
+--   functions            (just runs them, wrapped in pcall)
+--
+-- Standard Lua OOP setup: setmetatable({}, Maid) gives the new instance
+-- access to Maid's methods through __index. Without __index = Maid the
+-- method calls would error because the instance table is empty.
+
+local Maid = {}
+Maid.__index = Maid
+
+function Maid.new()
+	local self = setmetatable({}, Maid)
+	self._tasks = {}
+	return self
+end
+
+function Maid:GiveTask(item)
+	-- return the item so callers can store/chain without a separate var
+	table.insert(self._tasks, item)
+	return item
+end
+
+function Maid:DoCleaning()
+	-- swap the list out before iterating. if a cleanup callback adds
+	-- another task it lands in the new list, not the one we're looping
+	local snapshot = self._tasks
+	self._tasks = {}
+
+	for _, item in ipairs(snapshot) do
+		local kind = typeof(item)
+		if kind == "RBXScriptConnection" then
+			item:Disconnect()
+		elseif kind == "Instance" then
+			item:Destroy()
+		elseif kind == "function" then
+			-- pcall so one bad cleanup doesnt take the rest down with it
+			pcall(item)
+		end
+	end
+end
+
+-- alias to match Roblox's :Destroy convention
+Maid.Destroy = Maid.DoCleaning
+
+
+-- == Spectator ==
+-- Owns:
+--   _active     = are we spectating right now
+--   _index      = where we are in the player list
+--   _players    = snapshot of valid targets
+--   _maid       = per-target connections (cleared on every switch)
+--   _globalMaid = lives for the whole spectator
+--
+-- Camera transition:
+-- We briefly take scriptable control of the camera and tween its CFrame
+-- to a third-person spot behind the new target, then hand control back
+-- to the engine by setting CameraSubject. The CFrame math:
+--
+--   root.CFrame * CFrame.new(0, 5, 8)
+--      post-multiply means the offset is in the targets local space, so
+--      it rotates with them (5 up, 8 behind). pre-multiplying would put
+--      it in world space which is not what we want here.
+--
+--   CFrame.lookAt(eye, focus)
+--      builds a CFrame whose -Z axis points from eye to focus. we focus
+--      2 studs above the root part so the camera frames the torso
+--      instead of the feet.
+
+local Spectator = {}
+Spectator.__index = Spectator
+
+local TRANSITION_TIME = 0.35
+local TRANSITION_STYLE = Enum.EasingStyle.Quad
+local TRANSITION_DIRECTION = Enum.EasingDirection.Out
+
+local LOCAL_CAMERA_OFFSET = CFrame.new(0, 5, 8) -- 5 up, 8 behind, local space
+local FOCUS_OFFSET = Vector3.new(0, 2, 0) -- aim at upper body, not feet
+
+function Spectator.new()
+	local self = setmetatable({}, Spectator)
+	self._active = false
+	self._index = 0
+	self._players = {}
+	self._maid = Maid.new()
+	self._globalMaid = Maid.new()
+	return self
+end
+
+-- valid spectate targets = anyone who isnt us and has a loaded humanoid.
+-- rebuilt on demand because the player set doesnt change often enough
+-- to bother maintaining a live list
+function Spectator:_collectPlayers()
+	local list = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= Player then
+			local character = plr.Character
+			if character and character:FindFirstChildOfClass("Humanoid") then
+				table.insert(list, plr)
+			end
+		end
+	end
+	return list
+end
+
+-- tween the camera to a third-person view behind the humanoid.
+-- if theres no root part (mid-respawn etc.) just snap the subject so the
+-- camera doesnt end up frozen in scriptable mode
+function Spectator:_transitionCameraTo(humanoid)
+	local character = humanoid.Parent
+	local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+
+	if not rootPart then
+		Camera.CameraType = Enum.CameraType.Custom
+		Camera.CameraSubject = humanoid
+		return
+	end
+
+	-- scriptable so the engine doesnt fight our tween. on Custom it
+	-- would snap back to the previous subject every frame and the
+	-- transition would visibly stutter
+	Camera.CameraType = Enum.CameraType.Scriptable
+
+	local desiredPos = (rootPart.CFrame * LOCAL_CAMERA_OFFSET).Position
+	local focusPos = rootPart.Position + FOCUS_OFFSET
+	local targetCF = CFrame.lookAt(desiredPos, focusPos)
+
+	local tween = TweenService:Create(
+		Camera,
+		TweenInfo.new(TRANSITION_TIME, TRANSITION_STYLE, TRANSITION_DIRECTION),
+		{ CFrame = targetCF }
+	)
+
+	self._maid:GiveTask(tween.Completed:Connect(function(state)
+		-- only hand back if we still want to spectate AND the tween
+		-- finished naturally. cancelled = user cycled mid-transition,
+		-- the next call sets up its own state
+		if self._active and state == Enum.PlaybackState.Completed then
+			Camera.CameraType = Enum.CameraType.Custom
+			Camera.CameraSubject = humanoid
+		end
+	end))
+
+	-- if we tear down before completion, cancel so the camera isnt
+	-- stuck in scriptable mode forever
+	self._maid:GiveTask(function() tween:Cancel() end)
+
+	tween:Play()
+end
+
+-- bind to a target: attach now and reattach on every respawn. Died ->
+-- wait for the next character -> attach again. plus a CharacterAdded
+-- listener for any other replacement (manual LoadCharacter etc.)
+function Spectator:_attach(target)
+	-- per-target reset: kill old listeners/tweens before binding new
+	-- ones. without this, switching quickly stacks listeners and the
+	-- wrong humanoid wins (whichever Died fires first)
+	self._maid:DoCleaning()
+
+	if not target or not self._active then return end
+
+	local function bind(character)
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not humanoid or not self._active then return end
+
+		self:_transitionCameraTo(humanoid)
+
+		-- reattach when the target dies + respawns. the WaitForChild
+		-- has a 5s timeout so a stuck character wont yield forever
+		self._maid:GiveTask(humanoid.Died:Connect(function()
+			if not self._active then return end
+			local nextChar = target.Character or target.CharacterAdded:Wait()
+			local nextHum = nextChar:WaitForChild("Humanoid", 5)
+			if nextHum and self._active then
+				self:_transitionCameraTo(nextHum)
+			end
+		end))
+	end
+
+	if target.Character then
+		bind(target.Character)
+	end
+
+	self._maid:GiveTask(target.CharacterAdded:Connect(function(character)
+		local humanoid = character:WaitForChild("Humanoid", 5)
+		if humanoid and self._active then
+			bind(character)
+		end
+	end))
+end
+
+-- pick a random starting target. random so two clients dont always
+-- land on the same player when they open the menu at the same time.
+-- returns false if theres nobody to spectate (caller can show a notif)
+function Spectator:Start()
+	self._players = self:_collectPlayers()
+	if #self._players == 0 then
+		self._active = false
+		return false
+	end
+	self._active = true
+	self._index = math.random(1, #self._players)
+	self:_attach(self._players[self._index])
+	return true
+end
+
+-- stop and return the camera to the local player. set _active = false
+-- BEFORE cleaning so any callbacks firing during teardown see the
+-- right state
+function Spectator:Stop()
+	self._active = false
+	self._maid:DoCleaning()
+
+	Camera.CameraType = Enum.CameraType.Custom
+
+	local character = Player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		Camera.CameraSubject = humanoid
+	end
+end
+
+-- step through the list. +1 next, -1 prev. rebuilt every call so
+-- newly-joined players show up and leavers disappear
+function Spectator:Cycle(direction)
+	self._players = self:_collectPlayers()
+	if #self._players == 0 then return end
+
+	self._index = self._index + direction
+
+	-- wrap around. clamping would trap the user at the end of the list
+	-- which feels worse if you hold the cycle button
+	if self._index > #self._players then
+		self._index = 1
+	elseif self._index < 1 then
+		self._index = #self._players
+	end
+
+	self:_attach(self._players[self._index])
+end
+
+function Spectator:GetTarget()
+	if self._active and self._players[self._index] then
+		return self._players[self._index]
+	end
+	return nil
+end
+
+-- speed of the current target in studs/sec.
+-- AssemblyLinearVelocity is the post-physics-step velocity Roblox uses
+-- for collision response and replication, so its the "true" speed.
+-- .Magnitude collapses the Vector3 down to a scalar
+function Spectator:GetTargetSpeed()
+	local target = self:GetTarget()
+	if not target or not target.Character then return 0 end
+	local root = target.Character:FindFirstChild("HumanoidRootPart")
+	if not root then return 0 end
+	return root.AssemblyLinearVelocity.Magnitude
+end
+
+-- distance from us to the target in studs.
+-- (a - b).Magnitude = euclidean distance, the standard Roblox idiom
+function Spectator:GetTargetDistance()
+	local target = self:GetTarget()
+	if not target or not target.Character then return 0 end
+	if not Player.Character then return 0 end
+
+	local theirRoot = target.Character:FindFirstChild("HumanoidRootPart")
+	local ourRoot = Player.Character:FindFirstChild("HumanoidRootPart")
+	if not theirRoot or not ourRoot then return 0 end
+
+	return (theirRoot.Position - ourRoot.Position).Magnitude
+end
+
+-- if our target leaves, pick someone else (or stop if nobody is left).
+-- clamp instead of resetting to 1 so the user keeps roughly their place
+-- in the list
+function Spectator:HandlePlayerRemoving(removed)
+	if not self._active then return end
+	if self:GetTarget() ~= removed then return end
+
+	self._players = self:_collectPlayers()
+	if #self._players == 0 then
+		self:Stop()
+		return
+	end
+
+	self._index = math.clamp(self._index, 1, #self._players)
+	self:_attach(self._players[self._index])
+end
+
+function Spectator:Destroy()
+	self:Stop()
+	self._globalMaid:DoCleaning()
+end
+
+
+-- == TrollHandler ==
+
+local TrollHandler = {}
+
+function TrollHandler.Init(hud, dataReplica)
+	local trollFrame = hud.Frames.Troll
+	local trollButton = hud.HUD.Left.Troll
+	local holdFrame = trollFrame.Hold
+	local buttonsHold = trollFrame.ButtonsHold
+
+	local spectator = Spectator.new()
+	local maid = Maid.new()
+
+	-- optional speed/distance readout. only runs if the frame has a
+	-- "SpeedLabel" inside it. RenderStepped runs after physics so the
+	-- velocity reads the latest value
+	local speedLabel = trollFrame:FindFirstChild("SpeedLabel")
+	if speedLabel and speedLabel:IsA("TextLabel") then
+		maid:GiveTask(RunService.RenderStepped:Connect(function()
+			if not trollFrame.Visible then return end
+			local speed = spectator:GetTargetSpeed()
+			local distance = spectator:GetTargetDistance()
+			speedLabel.Text = string.format("Speed: %.1f studs/s | Dist: %.0f", speed, distance)
+		end))
+	end
+
+	-- main troll button toggle
+	maid:GiveTask(trollButton.MouseButton1Click:Connect(function()
+		if trollFrame.Visible then
+			Controllers.ToggleFrame(trollFrame)
+			return
+		end
+
+		-- dont open if alone in the server. quick scan instead of
+		-- _collectPlayers since we dont care about loaded humanoids
+		-- here, just whether anyone else is here at all
+		local hasOthers = false
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= Player then
+				hasOthers = true
+				break
+			end
+		end
+		if not hasOthers then
+			Notification:New("No other players in the server!", 2, "Error")
+			return
+		end
+
+		Controllers.ToggleFrame(trollFrame)
+
+		-- clear blur + reset FOV. other menus blur the background but
+		-- this one needs the world visible since youre looking at
+		-- another player through it
+		if trollFrame.Visible then
+			local blur = Lighting:FindFirstChildOfClass("BlurEffect")
+			if blur then
+				TweenService:Create(blur, TweenInfo.new(0.1), { Size = 0 }):Play()
+			end
+			TweenFov(70, 0.1)
+		end
+	end))
+
+	-- visibility drives spectating. any path that hides the frame (Exit
+	-- button, ESC, parent destroy) auto-stops without us having to call
+	-- Stop() everywhere
+	maid:GiveTask(trollFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+		if trollFrame.Visible then
+			spectator:Start()
+		else
+			spectator:Stop()
+		end
+	end))
+
+	-- delegate to spectator so the leave-policy lives next to the rest
+	-- of its state
+	maid:GiveTask(Players.PlayerRemoving:Connect(function(removed)
+		spectator:HandlePlayerRemoving(removed)
+	end))
+
+	maid:GiveTask(buttonsHold.LeftButton.MouseButton1Click:Connect(function()
+		spectator:Cycle(-1)
+	end))
+	maid:GiveTask(buttonsHold.RightButton.MouseButton1Click:Connect(function()
+		spectator:Cycle(1)
+	end))
+	maid:GiveTask(buttonsHold.Exit.MouseButton1Click:Connect(function()
+		Controllers.ToggleFrame(trollFrame)
+	end))
+
+	-- troll actions + the server remote
+	local trollActions = { "Kill", "Explode", "Fling", "BecomeSmall", "GrowHuge", "QuickSand" }
+	local TrollTarget = Remotes:WaitForChild("TrollTarget", 10)
+
+	for _, actionName in ipairs(trollActions) do
+		local actionFrame = holdFrame:FindFirstChild(actionName)
+		if not actionFrame then continue end
+
+		local productId = MonetizationList.products[actionName]
+		if not productId or productId == 0 then continue end
+
+		-- fetch + show the Robux price. spawned because GetProductInfo
+		-- can take a few hundred ms and we dont want it blocking the
+		-- rest of the UI setup
+		task.spawn(function()
+			local ok, info = pcall(
+				MarketplaceService.GetProductInfo,
+				MarketplaceService,
+				productId,
+				Enum.InfoType.Product
+			)
+			if ok and info and info.PriceInRobux then
+				local robuxIcon = actionFrame:FindFirstChild("RobuxIcon")
+				local robuxLabel = robuxIcon and robuxIcon:FindFirstChild("RobuxLabel")
+				if robuxLabel then
+					robuxLabel.Text = info.PriceInRobux .. "R$"
+				end
+			end
+		end)
+
+		-- click handler:
+		-- 1) send the target UserId to the server. UserId not Player
+		--    because the server validates against its own Players list
+		--    and we shouldnt trust an instance ref from a client
+		-- 2) open the purchase prompt. if the user pays, the servers
+		--    ProcessReceipt sees the stored target and applies the effect
+		local button = actionFrame:FindFirstChildWhichIsA("TextButton")
+		if button then
+			maid:GiveTask(button.MouseButton1Click:Connect(function()
+				local target = spectator:GetTarget()
+				if not target then return end
+
+				if TrollTarget then
+					TrollTarget:FireServer(target.UserId)
+				end
+
+				MarketplaceService:PromptProductPurchase(Player, productId)
+			end))
+		end
+	end
+
+	-- handle so the parent module can fully tear this down on logout
+	return {
+		Destroy = function()
+			spectator:Destroy()
+			maid:DoCleaning()
+		end,
+	}
+end
+
+return TrollHandler
