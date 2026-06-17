@@ -10,21 +10,23 @@
 	and a menu opens with left/right arrows, an exit button and 6 action
 	tiles (Kill Explode Fling BecomeSmall GrowHuge QuickSand). while its open
 	your cam detaches from your char and follows someone else, the arrows
-	cycle through everyone in the server. click a tile and it opens a robux
-	prompt on whoever youre watching
+	cycle through everyone in the server. the guy youre watching gets a red
+	glow + a name tag over their head so you dont lose them, and the arrow
+	keys / esc work too if you dont wanna click. click a tile and it opens a
+	robux prompt on whoever youre watching
 
 	split into 3 layers so it doesnt become spagetti
 	Maid: tiny cleanup helper, knows nothing about the game
-	spectator: owns the cam + playerlist, has a Maid inside
-	TrollHandler: hooks the hud buttons to a Spectator
+	spectator: owns the cam + playerlist + the glow/nametag, has a Maid inside
+	TrollHandler: hooks the hud buttons + keys to a Spectator
 
 	why split it: had it all in one scope before and conns kept leaking on
 	respawn + the camera stuff was tangled with the ui stuff so touching one
 	broke the other. now the ui layer is just plumbing, doesnt care how the
 	cleanup or cam transitions work
 
-	cleanup: every conn/tween gets handed to a Maid, call Destroy on the
-	handle and it all tears down. no manual disconnects anywhere
+	cleanup: every conn/tween/instance gets handed to a Maid, call Destroy on
+	the handle and it all tears down. no manual disconnects anywhere
 --]]
 
 local Players = game:GetService("Players")
@@ -33,6 +35,8 @@ local MarketplaceService = game:GetService("MarketplaceService")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local Lighting = game:GetService("Lighting")
+local UserInputService = game:GetService("UserInputService")
+local SoundService = game:GetService("SoundService")
 
 local Controllers = require(script.Parent)
 local MonetizationList = require(ReplicatedStorage.Shared.Misc.Monetization)
@@ -99,8 +103,9 @@ Maid.Destroy = Maid.DoCleaning
 -- _active: are we spectating rn
 -- _index: where we are in _players
 -- _players: snapshot of valid targets, rebuilt when needed
--- _maid: per target conns, wiped on every target switch
+-- _maid: per target conns + the glow/nametag, wiped on every target switch
 -- _globalMaid: lasts the whole spectator, wiped on Destroy
+-- _cycleSound: reused blip for cycling, lives the whole spectator
 
 --[[ camera stuff: on a target switch we grab scriptable control, tween the
 cam to a spot behind them then hand control back to the engine. two things
@@ -124,6 +129,13 @@ local LOCAL_CAMERA_OFFSET = CFrame.new(0, 5, 8)
 -- aim a bit above the root so its not all feet
 local FOCUS_OFFSET = Vector3.new(0, 2, 0)
 
+-- glow colors for the spectate highlight
+local HIGHLIGHT_FILL = Color3.fromRGB(255, 80, 80)
+local HIGHLIGHT_OUTLINE = Color3.fromRGB(255, 255, 255)
+
+-- built in studio sound for the cycle blip, always loads so theres no asset to upload
+local CYCLE_SOUND_ID = "rbxasset://sounds/electronicpingshort.wav"
+
 function Spectator.new()
 	local self = setmetatable({}, Spectator)
 	self._active = false
@@ -131,6 +143,13 @@ function Spectator.new()
 	self._players = {}
 	self._maid = Maid.new()
 	self._globalMaid = Maid.new()
+
+	-- one reused sound for the cycle blip, made once and lives as long as the spectator
+	self._cycleSound = Instance.new("Sound")
+	self._cycleSound.SoundId = CYCLE_SOUND_ID
+	self._cycleSound.Volume = 0.4
+	self._globalMaid:GiveTask(self._cycleSound)
+
 	return self
 end
 
@@ -190,6 +209,47 @@ function Spectator:_transitionCameraTo(humanoid)
 	tween:Play()
 end
 
+-- stick a glow + floating name tag on the target so you can find them in a crowd
+-- both parented to the char so they vanish with it on respawn, also on the maid so a target switch wipes them
+function Spectator:_decorateTarget(character)
+	local head = character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")
+	if not head then return end
+
+	-- AlwaysOnTop draws it through walls so you dont lose them behind geometry
+	local highlight = Instance.new("Highlight")
+	highlight.FillColor = HIGHLIGHT_FILL
+	highlight.OutlineColor = HIGHLIGHT_OUTLINE
+	highlight.FillTransparency = 0.6
+	highlight.OutlineTransparency = 0
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.Adornee = character
+	highlight.Parent = character
+	self._maid:GiveTask(highlight)
+
+	-- name tag. billboard always faces the cam, sits a bit above the head
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "SpectateTag"
+	billboard.Size = UDim2.fromOffset(200, 50)
+	billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
+	billboard.AlwaysOnTop = true
+	billboard.Adornee = head
+	billboard.Parent = character
+	self._maid:GiveTask(billboard)
+
+	-- GetPlayerFromCharacter so the label uses their DisplayName, matches the name normally shown over their head
+	local owner = Players:GetPlayerFromCharacter(character)
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Size = UDim2.fromScale(1, 1)
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.TextScaled = true
+	nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	nameLabel.TextStrokeTransparency = 0.5
+	nameLabel.Text = "Spectating " .. (owner and owner.DisplayName or "?")
+	-- parented to the billboard so it dies with it, no need to maid it on its own
+	nameLabel.Parent = billboard
+end
+
 -- listeners that keep the cam stuck to a target through respawns
 -- runs on every target switch. wipe the per target maid first or they pile up
 function Spectator:_attach(target)
@@ -203,6 +263,7 @@ function Spectator:_attach(target)
 		if not humanoid or not self._active then return end
 
 		self:_transitionCameraTo(humanoid)
+		self:_decorateTarget(character)
 
 		-- on death wait for the next char and rebind. WaitForChild 5s timeout so a stuck respawn cant hang this thread
 		self._maid:GiveTask(humanoid.Died:Connect(function()
@@ -211,6 +272,7 @@ function Spectator:_attach(target)
 			local nextHum = nextChar:WaitForChild("Humanoid", 5)
 			if nextHum and self._active then
 				self:_transitionCameraTo(nextHum)
+				self:_decorateTarget(nextChar)
 			end
 		end))
 	end
@@ -276,6 +338,9 @@ function Spectator:Cycle(direction)
 	end
 
 	self:_attach(self._players[self._index])
+
+	-- little blip so a cycle feels responsive even when the next guy is far / off screen
+	SoundService:PlayLocalSound(self._cycleSound)
 end
 
 -- who were watching, nil if not active
@@ -309,6 +374,16 @@ function Spectator:GetTargetDistance()
 	return (theirRoot.Position - ourRoot.Position).Magnitude
 end
 
+-- what the target is doing (Running Jumping Freefall etc) for the readout
+-- GetState reads the live humanoid state, .Name turns the enum into a short string
+function Spectator:GetTargetMoveState()
+	local target = self:GetTarget()
+	if not target or not target.Character then return "?" end
+	local humanoid = target.Character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return "?" end
+	return humanoid:GetState().Name
+end
+
 -- called from TrollHandler when anyone leaves
 -- only do something if it was the guy were watching
 -- clamp instead of resetting to 1 so you keep roughly your spot
@@ -326,7 +401,7 @@ function Spectator:HandlePlayerRemoving(removed)
 	self:_attach(self._players[self._index])
 end
 
--- nuke everything. Stop does the per target maid, then clear the global one incase smth got added there
+-- nuke everything. Stop does the per target maid, then clear the global one, thats where the cycle sound lives
 function Spectator:Destroy()
 	self:Stop()
 	self._globalMaid:DoCleaning()
@@ -335,7 +410,7 @@ end
 
 -- TrollHandler
 -- the actual module. HUD setup calls TrollHandler.Init with the HUD gui and the data replica
--- it wires up the buttons and hands back a handle with a Destroy
+-- it wires up the buttons + keys and hands back a handle with a Destroy
 -- split the setup into helper funcs below so each thing stays in its own scope
 
 local TrollHandler = {}
@@ -408,7 +483,7 @@ local function setupActionButton(actionFrame, productId, spectator, trollTargetR
 	end))
 end
 
--- optional speed/dist label, only runs if theres a SpeedLabel TextLabel in the frame
+-- optional speed/dist/state label, only runs if theres a SpeedLabel TextLabel in the frame
 -- RenderStepped so we read velocity after the physics step (freshest)
 -- skips everything while the menu is hidden, no point updating
 local function setupSpeedReadout(trollFrame, spectator, maid)
@@ -419,7 +494,8 @@ local function setupSpeedReadout(trollFrame, spectator, maid)
 		if not trollFrame.Visible then return end
 		local speed = spectator:GetTargetSpeed()
 		local distance = spectator:GetTargetDistance()
-		speedLabel.Text = string.format("Speed: %.1f studs/s | Dist: %.0f", speed, distance)
+		local state = spectator:GetTargetMoveState()
+		speedLabel.Text = string.format("Speed: %.1f studs/s | Dist: %.0f | %s", speed, distance, state)
 	end))
 end
 
@@ -482,6 +558,24 @@ local function setupCycleButtons(buttonsHold, trollFrame, spectator, maid)
 	end))
 end
 
+-- keyboard shortcuts for the menu, only act while its open (Visible check)
+-- arrows cycle, escape closes. same actions as the on screen arrow + exit buttons so mouse or keys both work
+local function setupKeyboardShortcuts(trollFrame, spectator, maid)
+	maid:GiveTask(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		-- gameProcessed = a textbox or core gui already used it, dont double handle
+		if gameProcessed or not trollFrame.Visible then return end
+
+		if input.KeyCode == Enum.KeyCode.Left then
+			spectator:Cycle(-1)
+		elseif input.KeyCode == Enum.KeyCode.Right then
+			spectator:Cycle(1)
+		elseif input.KeyCode == Enum.KeyCode.Escape then
+			-- dont stop the spectator straight from here, the frame is the source of truth so just close it
+			Controllers.ToggleFrame(trollFrame)
+		end
+	end))
+end
+
 -- run through the action names, find each in holdFrame and hook it up with setupActionButton
 local function setupActionButtons(holdFrame, spectator, maid)
 	local trollActions = { "Kill", "Explode", "Fling", "BecomeSmall", "GrowHuge", "QuickSand" }
@@ -509,15 +603,17 @@ function TrollHandler.Init(hud, dataReplica)
 	--  1) speed readout first so its already polling before anything can trigger spectating
 	--  2) toggle before the visibility hook so it doesnt fire visibility on a half built state (mostly defensive, theyre decoupled anyway)
 	--  3) action buttons last, they wait on the remote (10s WaitForChild) which can block for a sec
+	-- keyboard slots in after the cycle buttons, no special ordering, it just gates on frame Visible
 	setupSpeedReadout(trollFrame, spectator, maid)
 	setupTrollToggle(trollButton, trollFrame, maid)
 	setupVisibilityHook(trollFrame, spectator, maid)
 	setupPlayerLeaveHook(spectator, maid)
 	setupCycleButtons(buttonsHold, trollFrame, spectator, maid)
+	setupKeyboardShortcuts(trollFrame, spectator, maid)
 	setupActionButtons(holdFrame, spectator, maid)
 
 	-- handle for the parent
-	-- Destroy tears down the spectator (cam + per target conns) and the ui maid (every listener above)
+	-- Destroy tears down the spectator (cam + per target conns + glow/nametag + sound) and the ui maid (every listener above)
 	-- this is the only teardown path, nothing else needs manual cleanup
 	return {
 		Destroy = function()
@@ -527,6 +623,6 @@ function TrollHandler.Init(hud, dataReplica)
 	}
 end
 
--- didn't think I would need this many comments.
+-- ok now its definitely too many comments
 
 return TrollHandler
